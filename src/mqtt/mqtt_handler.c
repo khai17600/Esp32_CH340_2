@@ -1,27 +1,138 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
 
 #include "mqtt_client.h"
 #include "esp_log.h"
 #include "cJSON.h"
 
 #include "mqtt_handler.h"
+#include "esp_timer.h"
 #include "../hardware/hardware.h"
 
 
-#define MQTT_BROKER_URI \
-    "mqtt://192.168.1.9:1883"
+/* =========================================================
+ * MQTT CONFIG
+ * ========================================================= */
 
-#define REQUEST_TOPIC \
-    "elevator/request"
+#define MQTT_BROKER_URI   "mqtt://10.11.55.162:1883"
 
-#define STATUS_TOPIC \
-    "elevator/status"
+#define REQUEST_TOPIC     "elevator/request"
+#define STATUS_TOPIC      "elevator/status"
 
+
+/* =========================================================
+ * TAG
+ * ========================================================= */
 
 static const char *TAG = "MQTT";
 
+
+/* =========================================================
+ * MQTT CLIENT
+ * ========================================================= */
+
 static esp_mqtt_client_handle_t client = NULL;
+
+
+/* =========================================================
+ * DUPLICATE PROTECTION
+ * =========================================================
+ *
+ * Pi5 hiện tại chưa gửi request_id.
+ *
+ * Vì vậy tạm thời dùng:
+ *
+ * command + destination + thời gian
+ *
+ * Nếu cùng một CALL_ELEVATOR được nhận lại
+ * trong khoảng thời gian này -> bỏ.
+ *
+ * 5 giây > thời gian animation 3 giây.
+ */
+
+#define DUPLICATE_WINDOW_MS 5000
+
+static char last_command[32] = "";
+
+static int last_destination = -1;
+
+static int64_t last_request_time_ms = 0;
+
+
+/* =========================================================
+ * GET TIME
+ * ========================================================= */
+
+static int64_t mqtt_now_ms(void)
+{
+    return esp_timer_get_time() / 1000;
+}
+
+
+/* =========================================================
+ * DUPLICATE CHECK
+ * ========================================================= */
+
+static bool is_duplicate_request(
+    const char *command,
+    int destination
+)
+{
+    int64_t now =
+        mqtt_now_ms();
+
+
+    bool same_command =
+        strcmp(
+            last_command,
+            command
+        ) == 0;
+
+
+    bool same_destination =
+        last_destination ==
+        destination;
+
+
+    bool inside_window =
+        (now - last_request_time_ms)
+        <
+        DUPLICATE_WINDOW_MS;
+
+
+    if (
+        same_command &&
+        same_destination &&
+        inside_window
+    )
+    {
+        return true;
+    }
+
+
+    strncpy(
+        last_command,
+        command,
+        sizeof(last_command) - 1
+    );
+
+    last_command[
+        sizeof(last_command) - 1
+    ] = '\0';
+
+
+    last_destination =
+        destination;
+
+
+    last_request_time_ms =
+        now;
+
+
+    return false;
+}
 
 
 /* =========================================================
@@ -46,37 +157,23 @@ static void publish_status(
     switch (state)
     {
         case ELEVATOR_STATE_MOVING:
-
             state_string = "MOVING";
-
             break;
-
 
         case ELEVATOR_STATE_ARRIVED:
-
             state_string = "ARRIVED";
-
             break;
-
 
         case ELEVATOR_STATE_DOOR_OPEN:
-
             state_string = "DOOR_OPEN";
-
             break;
-
 
         case ELEVATOR_STATE_DOOR_CLOSED:
-
             state_string = "DOOR_CLOSED";
-
             break;
 
-
         default:
-
             state_string = "UNKNOWN";
-
             break;
     }
 
@@ -89,7 +186,7 @@ static void publish_status(
     {
         ESP_LOGE(
             TAG,
-            "Cannot create JSON"
+            "Cannot create JSON object"
         );
 
         return;
@@ -113,7 +210,9 @@ static void publish_status(
     cJSON_AddStringToObject(
         json,
         "source",
-        source
+        source != NULL
+        ? source
+        : "hardware"
     );
 
 
@@ -125,11 +224,6 @@ static void publish_status(
 
     if (payload == NULL)
     {
-        ESP_LOGE(
-            TAG,
-            "Cannot create JSON payload"
-        );
-
         cJSON_Delete(json);
 
         return;
@@ -153,14 +247,9 @@ static void publish_status(
     );
 
 
-    cJSON_free(
-        payload
-    );
+    cJSON_free(payload);
 
-
-    cJSON_Delete(
-        json
-    );
+    cJSON_Delete(json);
 }
 
 
@@ -211,6 +300,41 @@ static void handle_request(
     }
 
 
+    ESP_LOGI(
+        TAG,
+        "Command received: %s",
+        command->valuestring
+    );
+
+
+    /* =====================================================
+     * GET STATUS
+     * ===================================================== */
+
+    if (
+        strcmp(
+            command->valuestring,
+            "GET_STATUS"
+        ) == 0
+    )
+    {
+        int floor =
+            hardware_get_current_floor();
+
+
+        publish_status(
+            floor,
+            ELEVATOR_STATE_ARRIVED,
+            "status_request"
+        );
+
+
+        cJSON_Delete(json);
+
+        return;
+    }
+
+
     /* =====================================================
      * CALL ELEVATOR
      * ===================================================== */
@@ -242,19 +366,68 @@ static void handle_request(
         }
 
 
-        int destination_floor =
+        int floor =
             dest->valueint;
+
+
+        if (
+            floor != 1 &&
+            floor != 2
+        )
+        {
+            ESP_LOGE(
+                TAG,
+                "Invalid destination floor: %d",
+                floor
+            );
+
+            cJSON_Delete(json);
+
+            return;
+        }
+
+
+        /*
+         * ================================================
+         * DUPLICATE PROTECTION
+         * ================================================
+         */
+
+        if (
+            is_duplicate_request(
+                command->valuestring,
+                floor
+            )
+        )
+        {
+            ESP_LOGW(
+                TAG,
+                "Duplicate CALL_ELEVATOR ignored: floor=%d",
+                floor
+            );
+
+            cJSON_Delete(json);
+
+            return;
+        }
 
 
         ESP_LOGI(
             TAG,
-            "CALL_ELEVATOR -> floor %d",
-            destination_floor
+            "Queue elevator request: floor=%d",
+            floor
         );
 
 
+        /*
+         * QUAN TRỌNG:
+         *
+         * Hàm này bây giờ KHÔNG block.
+         *
+         * Nó chỉ đưa request vào queue.
+         */
         hardware_request_floor(
-            destination_floor,
+            floor,
             "mqtt"
         );
 
@@ -266,7 +439,7 @@ static void handle_request(
 
 
     /* =====================================================
-     * OPEN DOOR + HOLD
+     * OPEN DOOR
      * ===================================================== */
 
     if (
@@ -278,19 +451,12 @@ static void handle_request(
     {
         ESP_LOGI(
             TAG,
-            "OPEN_DOOR received from ROBOT"
+            "OPEN_DOOR received"
         );
 
 
-        /*
-         * Robot mở cửa và giữ.
-         *
-         * Button CLOSE trên ESP
-         * sẽ bị khóa.
-         */
-
         hardware_open_door_hold(
-            "mqtt_robot"
+            "mqtt"
         );
 
 
@@ -313,17 +479,12 @@ static void handle_request(
     {
         ESP_LOGI(
             TAG,
-            "CLOSE_DOOR received from ROBOT"
+            "CLOSE_DOOR received"
         );
 
 
-        /*
-         * Robot được phép đóng cửa
-         * kể cả khi đang ROBOT_HOLD.
-         */
-
         hardware_close_door(
-            "mqtt_robot"
+            "mqtt"
         );
 
 
@@ -359,14 +520,16 @@ static void mqtt_event_handler(
     void *event_data
 )
 {
+    (void)handler_args;
+    (void)base;
+
+
     esp_mqtt_event_handle_t event =
-        (esp_mqtt_event_handle_t)
-        event_data;
+        (esp_mqtt_event_handle_t)event_data;
 
 
     switch (
-        (esp_mqtt_event_id_t)
-        event_id
+        (esp_mqtt_event_id_t)event_id
     )
     {
         case MQTT_EVENT_CONNECTED:
@@ -384,19 +547,9 @@ static void mqtt_event_handler(
             );
 
 
-            ESP_LOGI(
-                TAG,
-                "Subscribed to %s",
-                REQUEST_TOPIC
-            );
-
-
             /*
-             * Báo vị trí hiện tại.
-             *
-             * Không báo MOVING.
+             * Báo trạng thái hiện tại.
              */
-
             publish_status(
                 hardware_get_current_floor(),
                 ELEVATOR_STATE_ARRIVED,
@@ -420,27 +573,14 @@ static void mqtt_event_handler(
 
             ESP_LOGI(
                 TAG,
-                "Subscribed successfully"
+                "Subscribed to %s",
+                REQUEST_TOPIC
             );
 
             break;
 
 
         case MQTT_EVENT_DATA:
-
-            ESP_LOGI(
-                TAG,
-                "MQTT request received"
-            );
-
-
-            ESP_LOGI(
-                TAG,
-                "Payload: %.*s",
-                event->data_len,
-                event->data
-            );
-
 
             handle_request(
                 event->data,
@@ -454,7 +594,7 @@ static void mqtt_event_handler(
 
             ESP_LOGE(
                 TAG,
-                "MQTT error"
+                "MQTT error event"
             );
 
             break;
@@ -474,11 +614,8 @@ static void mqtt_event_handler(
 void mqtt_handler_start(void)
 {
     /*
-     * Hardware thay đổi trạng thái
-     * -> gọi publish_status()
-     * -> MQTT gửi cho robot.
+     * Hardware -> MQTT callback.
      */
-
     hardware_set_status_callback(
         publish_status
     );
@@ -487,7 +624,7 @@ void mqtt_handler_start(void)
     esp_mqtt_client_config_t mqtt_cfg =
     {
         .broker.address.uri =
-            MQTT_BROKER_URI,
+            MQTT_BROKER_URI
     };
 
 
@@ -518,11 +655,5 @@ void mqtt_handler_start(void)
 
     esp_mqtt_client_start(
         client
-    );
-
-
-    ESP_LOGI(
-        TAG,
-        "MQTT client started"
     );
 }

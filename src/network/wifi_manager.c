@@ -15,8 +15,8 @@
 
 #include "wifi_manager.h"
 
-#define WIFI_SSID      "Thao Chi T5.1"
-#define WIFI_PASSWORD  "201719915"
+#define WIFI_SSID      "UET-Wifi-Office-Free 2.4Ghz"
+#define WIFI_PASSWORD  ""
 
 #define WIFI_CONNECTED_BIT BIT0
 
