@@ -10,6 +10,9 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_timer.h"
+#include "esp_random.h"
 
 #include "esp_log.h"
 #include "esp_err.h"
@@ -81,31 +84,40 @@ static int target_floor = 1;
 static bool moving = false;
 static int move_frame = 0;
 
-/* =========================================================
- * DOOR
- * ========================================================= */
-static door_mode_t door_mode = DOOR_MODE_CLOSED;
-static TickType_t door_auto_close_tick = 0;
+/* Only hardware_task owns the state machine; MQTT only sends copied requests. */
+static elevator_sync_t elevator;
+static QueueHandle_t command_queue;
+static sync_emit_fn status_callback;
 
-/* =========================================================
- * CALLBACK
- * ========================================================= */
-static hardware_status_callback_t status_callback = NULL;
-
-/* =========================================================
- * MOVEMENT SOURCE
- * ========================================================= */
-static const char *movement_source = "hardware";
-
-/* =========================================================
- * SEND STATUS
- * ========================================================= */
-static void send_status(elevator_state_t state, const char *source)
+static void forward_status(const sync_request_t *r, const char *result,
+                           const char *error, const sync_state_t *state)
 {
-    if (status_callback != NULL)
-    {
-        status_callback(current_floor, state, source);
+    static bool have_previous = false;
+    static sync_state_t previous;
+    if (!have_previous || state->moving != previous.moving ||
+        state->current_floor != previous.current_floor ||
+        state->target_floor != previous.target_floor) {
+        if (state->moving) {
+            ESP_LOGI(TAG, "[ELEVATOR] MOVING: %d -> %d", state->current_floor, state->target_floor);
+        } else if (have_previous && previous.moving) {
+            ESP_LOGI(TAG, "[ELEVATOR] ARRIVED: floor=%d", state->current_floor);
+        } else {
+            ESP_LOGI(TAG, "[ELEVATOR] AT FLOOR: %d", state->current_floor);
+        }
     }
+    if (!have_previous || state->door != previous.door) {
+        ESP_LOGI(TAG, "[DOOR] %s | floor=%d",
+                 state->door == SYNC_CLOSED ? "CLOSED" :
+                 state->door == SYNC_HOLD ? "OPEN + ROBOT HOLD" : "OPEN + AUTO (3s)",
+                 state->current_floor);
+    }
+    previous = *state;
+    have_previous = true;
+    /* Apply the simulated door output before acknowledging the command. */
+    gpio_set_level(LED_DOOR, state->door != SYNC_CLOSED);
+    gpio_set_level(LED_FLOOR_1, !state->moving && state->current_floor == 1);
+    gpio_set_level(LED_FLOOR_2, !state->moving && state->current_floor == 2);
+    if (status_callback) status_callback(r, result, error, state);
 }
 
 /* =========================================================
@@ -353,8 +365,13 @@ void hardware_init(void)
 
     target_floor = current_floor;
     moving = false;
-    door_mode = DOOR_MODE_CLOSED;
-    door_auto_close_tick = 0;
+    char boot_id[SYNC_ID_SIZE];
+    snprintf(boot_id, sizeof(boot_id), "%08lx%08lx%08lx%08lx",
+             (unsigned long)esp_random(), (unsigned long)esp_random(),
+             (unsigned long)esp_random(), (unsigned long)esp_random());
+    elevator_sync_init(&elevator, current_floor, boot_id, forward_status);
+    command_queue = xQueueCreate(16, sizeof(sync_request_t));
+    ESP_ERROR_CHECK(command_queue ? ESP_OK : ESP_ERR_NO_MEM);
 
     gpio_set_level(LED_DOOR, 0);
     gpio_set_level(LED_FLOOR_1, (current_floor == 1) ? 1 : 0);
@@ -375,214 +392,73 @@ void hardware_init(void)
     ESP_LOGI(TAG, "================================");
 }
 
-int hardware_get_current_floor(void)
-{
-    return current_floor;
-}
-
-void hardware_set_status_callback(hardware_status_callback_t callback)
+/* Register before creating hardware_task, so the callback is immutable at runtime. */
+void hardware_set_status_callback(sync_emit_fn callback)
 {
     status_callback = callback;
 }
 
-static void door_close_internal(const char *source)
+bool hardware_enqueue_request(const sync_request_t *request)
 {
-    gpio_set_level(LED_DOOR, 0);
-    door_mode = DOOR_MODE_CLOSED;
-    door_auto_close_tick = 0;
-
-    printf("[DOOR] CLOSED | source=%s | floor=%d\n", source, current_floor);
-    send_status(ELEVATOR_STATE_DOOR_CLOSED, source);
+    return command_queue && xQueueSend(command_queue, request, 0) == pdTRUE;
 }
 
-static void door_open_auto(const char *source)
+static void handle_button(const char *name, int floor, bool open, bool close, uint64_t now)
 {
-    gpio_set_level(LED_DOOR, 1);
-    door_mode = DOOR_MODE_AUTO;
-    door_auto_close_tick = xTaskGetTickCount() + pdMS_TO_TICKS(3000);
-
-    printf("[DOOR] OPEN | AUTO | source=%s | floor=%d\n", source, current_floor);
-    send_status(ELEVATOR_STATE_DOOR_OPEN, source);
+    ESP_LOGI(TAG, "[BUTTON] %s pressed", name);
+    if (elevator.state.moving) {
+        ESP_LOGW(TAG, "[BUTTON] %s ignored: elevator moving", name);
+    } else if (elevator.state.door == SYNC_HOLD) {
+        ESP_LOGW(TAG, "[BUTTON] %s ignored: ROBOT HOLD", name);
+    } else {
+        if (floor != 0 && floor == elevator.state.current_floor)
+            ESP_LOGI(TAG, "[ELEVATOR] Already at floor %d; opening door", floor);
+        elevator_sync_button(&elevator, floor, open, close, now);
+    }
 }
 
-void hardware_open_door_hold(const char *source)
-{
-    gpio_set_level(LED_DOOR, 1);
-    door_mode = DOOR_MODE_ROBOT_HOLD;
-    door_auto_close_tick = 0;
-
-    printf("[DOOR] OPEN + HOLD | source=%s | floor=%d\n", source, current_floor);
-    send_status(ELEVATOR_STATE_DOOR_OPEN, source);
-}
-
-void hardware_close_door(const char *source)
-{
-    if (door_mode == DOOR_MODE_CLOSED)
-    {
-        printf("[DOOR] Already closed\n");
-        return;
-    }
-
-    door_close_internal(source);
-}
-
-void hardware_request_floor(int floor, const char *source)
-{
-    if (floor != 1 && floor != 2)
-    {
-        printf("[ELEVATOR] Invalid floor: %d\n", floor);
-        return;
-    }
-
-    if (moving)
-    {
-        printf("[ELEVATOR] Already moving\n");
-        return;
-    }
-
-    if (door_mode == DOOR_MODE_ROBOT_HOLD)
-    {
-        ESP_LOGW(TAG, "Cua dang duoc ROBOT HOLD, tu choi di chuyen (nguon: %s)", source);
-        return;
-    }
-
-    if (floor == current_floor)
-    {
-        printf("[ELEVATOR] Already at floor %d\n", floor);
-        if (door_mode == DOOR_MODE_CLOSED)
-        {
-            door_open_auto(source);
-        }
-        tft_show_floor(current_floor);
-        return;
-    }
-
-    movement_source = source;
-    target_floor = floor;
-    moving = true;
-
-    printf("\n========================================\n");
-    printf("[ELEVATOR] MOVING: %d -> %d\n", current_floor, target_floor);
-
-    if (door_mode == DOOR_MODE_AUTO)
-    {
-        door_close_internal("auto");
-    }
-
-    gpio_set_level(LED_DOOR, 0);
-    door_mode = DOOR_MODE_CLOSED;
-    door_auto_close_tick = 0;
-
-    gpio_set_level(LED_FLOOR_1, 0);
-    gpio_set_level(LED_FLOOR_2, 0);
-
-    send_status(ELEVATOR_STATE_MOVING, source);
-
-    /* =====================================================
-     * ANIMATION DI CHUYỂN CHUẨN XÁC ĐÚNG 3.0 GIÂY
-     * ===================================================== */
-    TickType_t last_wake_time = xTaskGetTickCount();
-
-    for (int frame = 0; frame < 30; frame++)
-    {
-        move_frame = frame;
-
-        if (tft_buffer != NULL)
-        {
-            tft_flush_full();
-        }
-
-        // Tự động bù trừ thời gian render SPI để chu kỳ luôn đúng 100ms
-        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(100));
-    }
-
-    /* =====================================================
-     * ARRIVED
-     * ===================================================== */
-    current_floor = target_floor;
-    moving = false;
-    storage_save_floor(current_floor);
-
-    if (tft_buffer != NULL)
-    {
-        tft_show_floor(current_floor);
-    }
-
-    gpio_set_level(LED_FLOOR_1, (current_floor == 1) ? 1 : 0);
-    gpio_set_level(LED_FLOOR_2, (current_floor == 2) ? 1 : 0);
-
-    printf("[ELEVATOR] ARRIVED at floor %d\n", current_floor);
-    send_status(ELEVATOR_STATE_ARRIVED, source);
-
-    door_open_auto("auto");
-    printf("========================================\n");
-}
-
-/* =========================================================
- * HARDWARE TASK
- * ========================================================= */
 void hardware_task(void *arg)
 {
     (void)arg;
-
-    int last_btn1 = 0;
-    int last_btn2 = 0;
-    int last_open = 0;
-    int last_close = 0;
-
-    while (1)
-    {
+    int last_btn1 = 0, last_btn2 = 0, last_open = 0, last_close = 0;
+    uint64_t last_render = 0, last_report = 0;
+    int stored_floor = current_floor;
+    bool was_moving = false;
+    while (1) {
+        uint64_t now = esp_timer_get_time() / 1000;
+        elevator_sync_tick(&elevator, now);
+        sync_request_t request;
+        /* Bound work per tick; buttons/animation cannot be starved by MQTT. */
+        for (int i = 0; i < 4 && xQueueReceive(command_queue, &request, 0) == pdTRUE; ++i) {
+            elevator_sync_request(&elevator, &request, now);
+        }
         int btn1 = gpio_get_level(BUTTON_FLOOR_1);
         int btn2 = gpio_get_level(BUTTON_FLOOR_2);
-        int btn_open = gpio_get_level(BUTTON_OPEN);
-        int btn_close = gpio_get_level(BUTTON_CLOSE);
+        int open = gpio_get_level(BUTTON_OPEN);
+        int close = gpio_get_level(BUTTON_CLOSE);
+        if (btn1 && !last_btn1) handle_button("FLOOR 1", 1, false, false, now);
+        if (btn2 && !last_btn2) handle_button("FLOOR 2", 2, false, false, now);
+        if (open && !last_open) handle_button("OPEN", 0, true, false, now);
+        if (close && !last_close) handle_button("CLOSE", 0, false, true, now);
+        last_btn1 = btn1; last_btn2 = btn2; last_open = open; last_close = close;
 
-        if (door_mode == DOOR_MODE_AUTO && door_auto_close_tick != 0)
-        {
-            if (xTaskGetTickCount() >= door_auto_close_tick)
-            {
-                door_close_internal("auto");
-            }
+        current_floor = elevator.state.current_floor;
+        target_floor = elevator.state.target_floor;
+        moving = elevator.state.moving;
+        if (stored_floor != current_floor) {
+            storage_save_floor(current_floor);
+            stored_floor = current_floor;
         }
-
-        if (!moving)
-        {
-            if (btn1 == 1 && last_btn1 == 0)
-            {
-                hardware_request_floor(1, "button");
-            }
-
-            if (btn2 == 1 && last_btn2 == 0)
-            {
-                hardware_request_floor(2, "button");
-            }
-
-            if (btn_open == 1 && last_open == 0)
-            {
-                if (door_mode == DOOR_MODE_CLOSED)
-                {
-                    door_open_auto("button");
-                }
-            }
-
-            if (btn_close == 1 && last_close == 0)
-            {
-                if (door_mode == DOOR_MODE_AUTO)
-                {
-                    door_close_internal("button");
-                }
-                else if (door_mode == DOOR_MODE_ROBOT_HOLD)
-                {
-                    printf("[DOOR] CLOSE ignored (ROBOT HOLD)\n");
-                }
-            }
+        if ((moving && now - last_render >= 100) || moving != was_moving) {
+            move_frame = (int)(now / 100);
+            tft_flush_full();
+            last_render = now;
         }
-
-        last_btn1 = btn1;
-        last_btn2 = btn2;
-        last_open = btn_open;
-        last_close = btn_close;
-
+        was_moving = moving;
+        if (now - last_report >= 1000) {
+            elevator_sync_report(&elevator, now);
+            last_report = now;
+        }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }

@@ -33,13 +33,14 @@ static void wifi_event_handler(void *arg,
         if (event_id == WIFI_EVENT_STA_START)
         {
             ESP_LOGI(TAG, "Connecting...");
-            esp_wifi_connect();
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
         }
         else if (event_id == WIFI_EVENT_STA_DISCONNECTED)
         {
-            ESP_LOGI(TAG, "Disconnected. Reconnecting...");
+            const wifi_event_sta_disconnected_t *event = event_data;
             xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
-            esp_wifi_connect();
+            ESP_LOGW(TAG, "Disconnected: reason=%u; reconnecting", (unsigned)event->reason);
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
         }
     }
 
@@ -53,6 +54,11 @@ static void wifi_event_handler(void *arg,
                  IP2STR(&event->ip_info.ip));
 
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP)
+    {
+        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        ESP_LOGW(TAG, "Lost IP");
     }
 }
 
@@ -70,6 +76,7 @@ void wifi_init(void)
     ESP_ERROR_CHECK(ret);
 
     wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(wifi_event_group ? ESP_OK : ESP_ERR_NO_MEM);
 
     ESP_ERROR_CHECK(esp_netif_init());
 
@@ -88,6 +95,9 @@ void wifi_init(void)
             &wifi_event_handler,
             NULL,
             NULL));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_LOST_IP, wifi_event_handler, NULL, NULL));
 
     ESP_ERROR_CHECK(
         esp_event_handler_instance_register(
@@ -113,7 +123,7 @@ void wifi_init(void)
 
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    esp_wifi_set_ps(WIFI_PS_NONE);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_NONE));
 }
 
 bool wifi_wait_connected(uint32_t timeout_ms)

@@ -48,62 +48,12 @@ void app_main(void)
     hardware_init();
 
 
-    /*
-     * =====================================================
-     * 3. HARDWARE TASK
-     * =====================================================
-     *
-     * Task xử lý:
-     *
-     * - Nút tầng 1
-     * - Nút tầng 2
-     * - Nút OPEN
-     * - Nút CLOSE
-     * - Hiệu ứng TFT khi chuyển tầng
-     * - LED cửa
-     * - Trạng thái thang máy
-     *
-     * Stack 8192 để đủ cho phần render TFT.
-     */
-
-    xTaskCreate(
-        hardware_task,
-        "hardware_task",
-        8192,
-        NULL,
-        5,
-        NULL
-    );
-
-
-    /*
-     * =====================================================
-     * 4. WIFI
-     * =====================================================
-     */
-
+    /* Register MQTT status callback before starting the sole state owner. */
     wifi_init();
-
-
-    /*
-     * =====================================================
-     * 5. MQTT
-     * =====================================================
-     */
-
     mqtt_handler_start();
+    configASSERT(xTaskCreate(hardware_task, "hardware_task", 8192, NULL, 5, NULL) == pdPASS);
 
-
-    /*
-     * =====================================================
-     * MAIN LOOP
-     * =====================================================
-     */
-
-    while (1)
-    {
-        vTaskDelay(
-            pdMS_TO_TICKS(1000)
-        );
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }

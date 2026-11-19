@@ -1,3 +1,6 @@
+#include <stdbool.h>
+#include <stdint.h>
+
 #ifndef WIFI_MANAGER_H
 #define WIFI_MANAGER_H
 
