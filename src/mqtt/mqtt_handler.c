@@ -276,6 +276,7 @@ void mqtt_handler_start(void)
 {
     esp_mqtt_client_config_t config = {
         .broker.address.uri = MQTT_BROKER_URI,
+        .network.timeout_ms = 4000,
         .network.reconnect_timeout_ms = 3000,
         .outbox.limit = 16384,
     };
