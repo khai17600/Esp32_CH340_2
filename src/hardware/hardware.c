@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_timer.h"
 #include "esp_random.h"
 
@@ -75,6 +76,15 @@ static const char *TAG = "HARDWARE";
 static esp_lcd_panel_io_handle_t tft_io = NULL;
 static esp_lcd_panel_handle_t tft_panel = NULL;
 static uint16_t *tft_buffer = NULL;
+static SemaphoreHandle_t tft_done;
+
+/* Panel draws are async: the single strip buffer may be reused only after DMA finishes. */
+static bool tft_trans_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *e, void *ctx)
+{
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(tft_done, &woken);
+    return woken == pdTRUE;
+}
 
 /* =========================================================
  * ELEVATOR STATE
@@ -262,6 +272,11 @@ static void tft_flush_full(void)
             ESP_LOGE(TAG, "TFT draw failed: %s", esp_err_to_name(err));
             return;
         }
+        if (xSemaphoreTake(tft_done, pdMS_TO_TICKS(100)) != pdTRUE)
+        {
+            ESP_LOGE(TAG, "TFT transfer timeout");
+            return;
+        }
     }
 }
 
@@ -300,8 +315,12 @@ static void tft_init(void)
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
         .spi_mode = 0,
-        .trans_queue_depth = 4
+        .trans_queue_depth = 4,
+        .on_color_trans_done = tft_trans_done
     };
+
+    tft_done = xSemaphoreCreateBinary();
+    ESP_ERROR_CHECK(tft_done ? ESP_OK : ESP_ERR_NO_MEM);
 
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)TFT_SPI_HOST, &io_config, &tft_io));
 

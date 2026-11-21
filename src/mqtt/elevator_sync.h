@@ -53,6 +53,7 @@ typedef struct {
     sync_record_t cache[SYNC_CACHE_SIZE];
     sync_session_t sessions[SYNC_SESSION_SIZE];
     unsigned next_record;
+    unsigned next_session;
     int pending_record;
 } elevator_sync_t;
 
