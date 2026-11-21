@@ -84,6 +84,18 @@ int main(void)
     sync_request_t expired = request(50, "CLOSE_DOOR"); expired.expires_at_ms = 1;
     elevator_sync_request(&s, &expired, 25000);
     assert(!strcmp(error, "EXPIRED_REQUEST") && s.state.door == SYNC_HOLD);
+    /* Hold times out even if the robot never comes back. */
+    elevator_sync_tick(&s, 23000 + 50 + 60000);
+    assert(s.state.door == SYNC_CLOSED);
+    /* More than SYNC_SESSION_SIZE sessions: old ones are recycled, not rejected. */
+    for (unsigned i = 0; i < 20; ++i) {
+        sync_request_t r = request(1, "CLOSE_DOOR");
+        snprintf(r.session_id, sizeof(r.session_id), "s%u", i);
+        snprintf(r.request_id, sizeof(r.request_id), "q%u", i);
+        r.expires_at_ms = 200000;
+        elevator_sync_request(&s, &r, 90000);
+        assert(!strcmp(result, "COMPLETED"));
+    }
     elevator_sync_init(&s, 1, "boot2", capture);
     elevator_sync_request(&s, &close, 0);
     assert(!strcmp(error, "BOOT_MISMATCH"));

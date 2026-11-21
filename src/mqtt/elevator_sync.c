@@ -2,6 +2,8 @@
 #include "elevator_sync.h"
 #include <string.h>
 
+#define HOLD_TIMEOUT_MS 60000
+
 static void emit(elevator_sync_t *s, const sync_request_t *r, const char *result, const char *error)
 {
     ++s->state.status_seq;
@@ -86,13 +88,13 @@ void elevator_sync_request(elevator_sync_t *s, const sync_request_t *r, uint64_t
         if (!strcmp(s->sessions[i].id, r->session_id)) { session = &s->sessions[i]; break; }
     }
     if (!session) {
-        for (unsigned i = 0; i < SYNC_SESSION_SIZE; ++i) {
-            if (!s->sessions[i].id[0]) {
-                session = &s->sessions[i];
-                strcpy(session->id, r->session_id);
-                break;
-            }
-        }
+        /* Table full: recycle round-robin. Replays are still caught by the record cache and expiry. */
+        unsigned slot = 0;
+        while (slot < SYNC_SESSION_SIZE && s->sessions[slot].id[0]) ++slot;
+        if (slot == SYNC_SESSION_SIZE) slot = s->next_session++ % SYNC_SESSION_SIZE;
+        session = &s->sessions[slot];
+        strcpy(session->id, r->session_id);
+        session->highest_seq = 0;
     }
     if (!session) { emit(s, r, "REJECTED", "SESSION_CAPACITY"); return; }
     if (r->command_seq <= session->highest_seq) { emit(s, r, "REJECTED", "STALE_REQUEST"); return; }
@@ -130,7 +132,7 @@ void elevator_sync_request(elevator_sync_t *s, const sync_request_t *r, uint64_t
     }
     if (!strcmp(r->command, "OPEN_DOOR")) {
         s->state.door = SYNC_HOLD;
-        s->state.close_at_ms = 0;
+        s->state.close_at_ms = now + HOLD_TIMEOUT_MS;  /* robot gone => door still closes */
         strcpy(s->state.hold_session, r->session_id);
     } else {
         door_close(s);  /* Already closed is also a successful command. */
@@ -151,7 +153,7 @@ void elevator_sync_tick(elevator_sync_t *s, uint64_t now)
             finish(s, record, "");
         } else emit(s, NULL, "STATUS", "");
     }
-    if (s->state.door == SYNC_AUTO && now >= s->state.close_at_ms) {
+    if (s->state.door != SYNC_CLOSED && now >= s->state.close_at_ms) {
         door_close(s);
         emit(s, NULL, "STATUS", "");
     }
